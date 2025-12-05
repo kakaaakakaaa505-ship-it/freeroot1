@@ -35,8 +35,11 @@ error() {
 
 # Проверка root прав
 if [ "$EUID" -eq 0 ]; then 
-    error "Не запускайте скрипт от root!"
-    exit 1
+    warn "Скрипт запущен от root. Распаковка будет без ошибок."
+    IS_ROOT=true
+else
+    info "Скрипт запущен без root прав. Некоторые файлы могут не распаковаться."
+    IS_ROOT=false
 fi
 
 # Ссылки на Ubuntu rootfs (GitHub mirror)
@@ -48,7 +51,6 @@ UBUNTU_20_04_AARCH64="https://github.com/termux/proot-distro/releases/download/v
 # Параметры по умолчанию
 TARGET_DIR="$PWD/ubuntu-rootfs"
 ROOTFS_FILE="ubuntu-rootfs.tar.xz"
-USE_UBUNTU_24_10=true
 
 # Выбор версии Ubuntu
 echo "Выберите версию Ubuntu:"
@@ -130,27 +132,67 @@ else
     exit 1
 fi
 
-# Распаковка rootfs
+# Распаковка rootfs с игнорированием ошибок для устройств
 info "Распаковка rootfs..."
 if command -v tar &> /dev/null; then
-    if tar -xJf "$ROOTFS_FILE" --checkpoint=.100; then
+    # Показать содержимое архива
+    info "Содержимое архива:"
+    tar -tf "$ROOTFS_FILE" | head -5
+    
+    # Распаковка с игнорированием ошибок создания устройств
+    if tar -xJf "$ROOTFS_FILE" --warning=no-unknown-keyword 2>/dev/null || tar -xJf "$ROOTFS_FILE" --no-same-owner 2>/dev/null; then
         info "Распаковка завершена!"
         
         # Удаление архива после распаковки
         rm -f "$ROOTFS_FILE"
         
         # Проверка содержимого
-        if [ -d "./etc" ] && [ -d "./bin" ] && [ -d "./usr" ]; then
+        if [ -d "./bin" ] && [ -d "./usr" ]; then
             info "Rootfs успешно распакован в: $TARGET_DIR"
+            
+            # Создание недостающих device файлов (если их нет)
+            if [ ! -e "./dev/null" ]; then
+                info "Создание базовых файлов устройств..."
+                mkdir -p ./dev
+                mknod ./dev/null c 1 3 2>/dev/null || true
+                mknod ./dev/zero c 1 5 2>/dev/null || true
+                mknod ./dev/random c 1 8 2>/dev/null || true
+                mknod ./dev/urandom c 1 9 2>/dev/null || true
+                mkdir -p ./dev/pts
+                mkdir -p ./dev/shm
+            fi
+            
+            # Создание минимальной структуры
+            mkdir -p ./proc ./sys ./tmp ./run ./home
+            chmod 1777 ./tmp
+            
             info "Содержимое:"
             ls -la | head -10
         else
-            warn "Структура rootfs выглядит неполной. Возможны проблемы."
+            # Проверяем, возможно архив содержит подпапку
+            subdir=$(tar -tf "$ROOTFS_FILE" | head -1 | cut -d'/' -f1)
+            if [ -d "$subdir" ]; then
+                info "Обнаружена подпапка: $subdir"
+                mv "$subdir"/* ./
+                rm -rf "$subdir"
+                info "Файлы перемещены в корень."
+            else
+                warn "Структура rootfs выглядит неполной. Проверяем..."
+                ls -la
+            fi
         fi
     else
-        error "Ошибка при распаковке архива."
-        error "Проверьте целостность файла: tar -tf $ROOTFS_FILE | head -5"
-        exit 1
+        warn "Попытка альтернативного метода распаковки..."
+        # Альтернативный метод
+        xz -dc "$ROOTFS_FILE" | tar -x --exclude='./dev/*' 2>/dev/null
+        if [ $? -eq 0 ]; then
+            info "Распаковка завершена альтернативным методом!"
+            rm -f "$ROOTFS_FILE"
+        else
+            error "Ошибка при распаковке архива."
+            error "Попробуйте: tar -tf $ROOTFS_FILE | head -10"
+            exit 1
+        fi
     fi
 else
     error "tar не найден. Установите tar и повторите попытку."
@@ -159,36 +201,87 @@ fi
 
 # Создание базовых файлов
 info "Настройка базовой системы..."
-cat > "$TARGET_DIR/etc/resolv.conf" << EOF
+cat > "./etc/resolv.conf" 2>/dev/null << EOF || true
 nameserver 8.8.8.8
 nameserver 1.1.1.1
 EOF
 
-cat > "$TARGET_DIR/etc/hosts" << EOF
+cat > "./etc/hosts" 2>/dev/null << EOF || true
 127.0.0.1 localhost
 ::1 localhost ip6-localhost ip6-loopback
 EOF
 
+# Проверка наличия passwd и group файлов
+if [ ! -f "./etc/passwd" ]; then
+    warn "Файл /etc/passwd не найден. Создаем базовый..."
+    echo "root:x:0:0:root:/root:/bin/bash" > ./etc/passwd
+fi
+
+if [ ! -f "./etc/group" ]; then
+    warn "Файл /etc/group не найден. Создаем базовый..."
+    echo "root:x:0:" > ./etc/group
+fi
+
 # Создание скрипта для входа в chroot
-cat > "$TARGET_DIR/../start-ubuntu.sh" << EOF
+cd ..
+cat > "start-ubuntu.sh" << 'EOF'
 #!/bin/bash
-echo "Запуск Ubuntu $UBUNTU_VERSION в chroot..."
-echo "Используйте 'exit' для выхода"
+echo "################################################################"
+echo "#         Запуск Ubuntu в chroot/proot                         #"
+echo "#   Используйте 'exit' для выхода                             #"
+echo "################################################################"
+
+TARGET_DIR="$(dirname "$(realpath "$0")")/ubuntu-rootfs"
+
+if [ ! -d "$TARGET_DIR" ]; then
+    echo "Ошибка: Директория $TARGET_DIR не найдена!"
+    exit 1
+fi
+
+echo "Директория: $TARGET_DIR"
 
 # Проверка наличия proot (для работы без root)
 if command -v proot &> /dev/null; then
-    proot -0 -w /root -r "$TARGET_DIR" -b /dev -b /proc -b /sys /bin/bash
-elif [ "\$(id -u)" -eq 0 ]; then
+    echo "Используется proot (без root прав)..."
+    proot \
+        -0 \
+        -w /root \
+        -r "$TARGET_DIR" \
+        -b /dev \
+        -b /proc \
+        -b /sys \
+        -b /dev/pts \
+        -b /dev/shm \
+        -b /tmp \
+        /bin/bash --login
+elif [ "$(id -u)" -eq 0 ]; then
+    echo "Используется chroot (с root правами)..."
+    mount --bind /dev "$TARGET_DIR/dev"
+    mount --bind /proc "$TARGET_DIR/proc"
+    mount --bind /sys "$TARGET_DIR/sys"
+    mount --bind /dev/pts "$TARGET_DIR/dev/pts"
     chroot "$TARGET_DIR" /bin/bash
+    umount "$TARGET_DIR/dev/pts"
+    umount "$TARGET_DIR/sys"
+    umount "$TARGET_DIR/proc"
+    umount "$TARGET_DIR/dev"
 else
     echo "Требуются root права или установите proot:"
-    echo "Для Debian/Ubuntu: apt install proot"
-    echo "Для Termux: pkg install proot"
-    echo "Запуск с sudo: sudo chroot \"$TARGET_DIR\" /bin/bash"
+    echo ""
+    echo "Для Termux:"
+    echo "    pkg install proot"
+    echo ""
+    echo "Для Debian/Ubuntu:"
+    echo "    sudo apt install proot"
+    echo ""
+    echo "Для запуска с root правами:"
+    echo "    sudo bash $0"
+    echo ""
+    echo "Или установите proot и запустите снова."
 fi
 EOF
 
-chmod +x "$TARGET_DIR/../start-ubuntu.sh"
+chmod +x "start-ubuntu.sh"
 
 # Финальное сообщение
 echo ""
@@ -199,15 +292,13 @@ echo ""
 echo "Rootfs установлен в: $(realpath "$TARGET_DIR")"
 echo ""
 echo "Для запуска Ubuntu выполните:"
-echo "    cd $(dirname "$(realpath "$TARGET_DIR")")"
 echo "    ./start-ubuntu.sh"
 echo ""
-echo "Или с root правами:"
-echo "    sudo chroot \"$TARGET_DIR\" /bin/bash"
+echo "Если есть ошибки с устройствами, попробуйте:"
+echo "    sudo ./start-ubuntu.sh"
 echo ""
 echo "Доступные команды внутри chroot:"
 echo "    apt update && apt upgrade  # Обновление системы"
 echo "    apt install <package>      # Установка пакетов"
-echo "    apt-get clean              # Очистка кэша"
 echo ""
 echo "#######################################################################################"
